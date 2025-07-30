@@ -1,0 +1,38 @@
+[project]
+name = "schroedinger_bridge_pinn"
+version = "0.1.0"
+description = "A Python package for solving the Schrödinger Bridge equation using Physics-Informed Neural Networks"
+authors = [{name = "Robert Ziegler", email = "roziegler@student.ethz.ch"}]
+readme = "Readme.md"
+requires-python = ">=3.10.13"
+
+dependencies = [
+    "torch==2.5.1+cu121",
+    "pytorch-lightning",
+    "numpy",
+    "matplotlib",
+    "ipykernel",
+    "wandb",
+    "diffrax",
+    "optax",
+    "equinox",
+    "tk",
+    "jax[cuda12]",
+    "pandas",
+    "py-pde",
+]
+
+[[tool.uv.index]]
+name = "pytorch-index"
+url = "https://download.pytorch.org/whl/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-index-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-index"},
+]
