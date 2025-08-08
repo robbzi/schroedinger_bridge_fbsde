@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "A Python package for solving the Schrödinger Bridge equation using Physics-Informed Neural Networks"
 authors = [{name = "Robert Ziegler", email = "roziegler@student.ethz.ch"}]
 readme = "Readme.md"
-requires-python = ">=3.10.13"
+#requires-python = ">=3.10.13"
+requires-python = ">=3.12.0"
 
 dependencies = [
     "torch==2.5.1+cu121",
@@ -19,8 +20,16 @@ dependencies = [
     "tk",
     "jax[cuda12]",
     "pandas",
-    "py-pde",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff~=0.12.7",
+    "pytest~=8.4.1",
+    "pyright~=1.1.403",
+    "deptry~=0.23.1",
+]
+
 
 [[tool.uv.index]]
 name = "pytorch-index"
@@ -36,3 +45,13 @@ explicit = true
 torch = [
     { index = "pytorch-index"},
 ]
+
+
+[tool.pyright]
+reportMissingImports = false
+useLibraryCodeForTypes = true # default Pylance behavior
+reportPrivateImportUsage = false # too many false positives from bad PyTorch stubs
+executionEnvironments = [
+    { root = ".", extraPaths = ["../voize_pycore", "../voize_nn" ]}
+]
+include = ["src"]
