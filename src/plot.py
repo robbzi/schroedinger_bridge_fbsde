@@ -2,7 +2,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from datasets import PathDataset
+from datasets import ForwardBackwardNoiseDataset
+from models import LitSchroedingerBridgePINN
 
 
 def plot_path_batch(paths, time_grid_tensor, title="SDE Paths", save_path=None):
@@ -31,35 +32,35 @@ def plot_path_batch(paths, time_grid_tensor, title="SDE Paths", save_path=None):
         plt.show()
 
 
-def plot_paths_from_prior(
-    simulation_dataset: PathDataset, constants, max_nbr_paths=1000
-):
-    """
-    Plot one batch of paths from the prior distribution.
-    """
-    d = constants["d"]
-    if d != 1:
-        raise ValueError("This function is only for 1D models.")
+# def plot_paths_from_prior(
+#     simulation_dataset: PathDataset, constants, max_nbr_paths=1000
+# ):
+#     """
+#     Plot one batch of paths from the prior distribution.
+#     """
+#     d = constants["d"]
+#     if d != 1:
+#         raise ValueError("This function is only for 1D models.")
 
-    fig, ax = plt.subplots()
-    T = constants["T"]
+#     fig, ax = plt.subplots()
+#     T = constants["T"]
 
-    # get batch
-    batch = next(iter(simulation_dataset))[:max_nbr_paths, :, :]
-    # plot
-    time_grid = np.linspace(0, T, batch.shape[1])
-    for i in range(batch.shape[0]):
-        # make the line width small
-        ax.plot(time_grid, batch[i, :, 1].cpu().numpy(), alpha=0.3, linewidth=0.5)
+#     # get batch
+#     batch = next(iter(simulation_dataset))[:max_nbr_paths, :, :]
+#     # plot
+#     time_grid = np.linspace(0, T, batch.shape[1])
+#     for i in range(batch.shape[0]):
+#         # make the line width small
+#         ax.plot(time_grid, batch[i, :, 1].cpu().numpy(), alpha=0.3, linewidth=0.5)
 
-    ax.set_xlim(0, T)
+#     ax.set_xlim(0, T)
 
-    return fig, ax
+#     return fig, ax
 
 
 def plot_paths_from_prior_and_final(
-    simulation_dataset_forward: PathDataset,
-    simulation_dataset_backward: PathDataset,
+    schroedinger_bridge_module: LitSchroedingerBridgePINN,
+    dataset: ForwardBackwardNoiseDataset,
     constants,
     max_nbr_paths=1000,
 ):
@@ -72,14 +73,18 @@ def plot_paths_from_prior_and_final(
         raise ValueError("This function is only for 1D models.")
     T = constants["T"]
     # get batch
-    batch_forward = next(iter(simulation_dataset_forward))[:max_nbr_paths, :, :]
-    batch_backward = next(iter(simulation_dataset_backward))[:max_nbr_paths, :, :]
+    batch = next(iter(dataset))
+    forward_paths, backward_paths = schroedinger_bridge_module.generate_paths_only(
+        batch
+    )
+    forward_paths = forward_paths[:max_nbr_paths, :, :]
+    backward_paths = backward_paths[:max_nbr_paths, :, :]
     # plot forward paths
-    time_grid = np.linspace(0, T, batch_forward.shape[1])
-    for i in range(batch_forward.shape[0]):
+    time_grid = np.linspace(0, T, forward_paths.shape[1])
+    for i in range(forward_paths.shape[0]):
         # make the line width small
         ax[0].plot(
-            time_grid, batch_forward[i, :, 1].cpu().numpy(), alpha=0.3, linewidth=0.5
+            time_grid, forward_paths[i, :, 1].detach().cpu().numpy(), alpha=0.3, linewidth=0.5
         )
     ax[0].set_title("Paths from Prior Distribution")
     ax[0].set_xlim(0, T)
@@ -87,10 +92,10 @@ def plot_paths_from_prior_and_final(
     ax[0].set_ylabel("Value")
 
     # plot backward paths
-    for i in range(batch_backward.shape[0]):
+    for i in range(backward_paths.shape[0]):
         # make the line width small
         ax[1].plot(
-            time_grid, batch_backward[i, :, 1].cpu().numpy(), alpha=0.3, linewidth=0.5
+            time_grid, backward_paths[i, :, 1].detach().cpu().numpy(), alpha=0.3, linewidth=0.5
         )
     ax[1].set_title("Paths from Final Distribution")
     ax[1].set_xlim(0, T)

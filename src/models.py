@@ -36,6 +36,8 @@ class NNAnsatz(nn.Module):
 
         # add time dimension
         input_dimension = input_dimension + 1
+        # TODO: remove this as this is always true
+        self.prepend_time_grid = True
         self.input_dimension = input_dimension
         self.output_dimension = output_dimension
         self.batch_normalization = batch_normalization
@@ -121,8 +123,8 @@ class NNAnsatz(nn.Module):
         assert not self.exp_output, (
             "This method is only for models with exp_output=False."
         )
-        
-        #x.requires_grad = True
+
+        # x.requires_grad = True
         y = self.model(x)
         grad = torch.autograd.grad(
             torch.sum(y),
@@ -147,6 +149,7 @@ class NNAnsatz(nn.Module):
     def drift_sde_solution_func(
         self,
         init_vals: torch.Tensor,
+        noise: torch.Tensor,
     ) -> torch.Tensor:
         """
         Drift SDE solution function. Assumes particles are transported by the vector field
@@ -155,7 +158,9 @@ class NNAnsatz(nn.Module):
         # self.model.eval()
         # self.model.to("cuda")
         # TODO: ensure init_vals are generated on cuda, and copy constructed on cuda
-        init_vals = init_vals.to("cuda")
+        # init_vals = init_vals.to("cuda")
+        assert init_vals.device == torch.device("cuda", index=0)
+        assert noise.device == torch.device("cuda", index=0)
         init_vals.requires_grad = True
         # dt can be unevenly spaced
         # TODO: we can save this computation by adding self.dt as a property
@@ -170,26 +175,14 @@ class NNAnsatz(nn.Module):
         )
         dt = torch.abs(dt)
 
-        # d dimensional noise increments
-        noise = torch.randn(
-            (
-                init_vals.shape[0],
-                self.time_grid_tensor.shape[0] - 1,
-                init_vals.shape[1],
-            ),
-            device=init_vals.device,
-        )
-
-        # initialize X with zeros
-        X = torch.zeros(
-            (init_vals.shape[0], self.time_grid_tensor.shape[0], init_vals.shape[1]),
-            device=init_vals.device,
-        )
-        
-
         # TODO: do we need to move the model to the device? Maybe to it externally
+        ## initialize X with zeros
+        # X = torch.zeros(
+        #     (init_vals.shape[0], self.time_grid_tensor.shape[0], init_vals.shape[1]),
+        #     device=init_vals.device,
+        # )
         # # set initial value
-        #X[:, 0, :] = init_vals
+        # X[:, 0, :] = init_vals
         # for t in range(1, len(self.time_grid_tensor)):
         #     X_for_forward = X[:, t - 1, :]
         #     # concatenate with time step
@@ -213,7 +206,7 @@ class NNAnsatz(nn.Module):
         #     )
         # return X
 
-                # Build path without writing into a base tensor referenced by views
+        # Build path without writing into a base tensor referenced by views
         X_list = []
         x_prev = init_vals
         X_list.append(x_prev)
@@ -230,7 +223,11 @@ class NNAnsatz(nn.Module):
                 spacial_only=True,
             )
             # Euler–Maruyama step
-            x_next = x_prev + drift * current_dt + torch.sqrt(current_dt) * noise[:, t - 1, :]
+            x_next = (
+                x_prev
+                + drift * current_dt
+                + torch.sqrt(current_dt) * noise[:, t - 1, :]
+            )
             X_list.append(x_next)
             x_prev = x_next
 
@@ -354,7 +351,7 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         cov = 1.0
         self.log_p_0 = (
             lambda x: (-0.5 * self.dim * torch.log(torch.tensor(2 * torch.pi * cov)))
-            + -0.5 * torch.sum((x - 3) ** 2 / cov, dim=-1)[:, None]
+            + -0.5 * torch.sum((x - 5) ** 2 / cov, dim=-1)[:, None]
         )
         self.log_p_T = (
             lambda x: (-0.5 * self.dim * torch.log(torch.tensor(2 * torch.pi * cov)))
@@ -364,9 +361,10 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         # not configurable for now
         self.loss_weights = {
             "pde": 1.0,
-            "bc": 10.0,
+            "bc": 1.0,#10.0,
+            "loglik": 20.0,
         }
-        self.decay_rate = 0.9993
+        self.decay_rate = 0.993
 
         # Important: This property activates manual optimization.
         self.automatic_optimization = False
@@ -415,14 +413,15 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         # TODO: we want to be able to configure the number of interior and boundary points
         # TODO: we only need forward or backward points depending on the current block
         # when not training jointly
-        x_forward_interior, x_forward_bc = (
-            batch["forward_interior"],
-            batch["forward_bc"],
-        )
-        x_backward_interior, x_backward_bc = (
-            batch["backward_interior"],
-            batch["backward_bc"],
-        )
+        # create paths
+        x_forward_paths = self._create_paths(batch, backward=False)
+        x_backward_paths = self._create_paths(batch, backward=True)
+        x_forward_bc = x_forward_paths[:, -1, :]
+        x_backward_bc = x_backward_paths[:, 0, :]
+
+        x_init_vals = x_forward_paths[:, 0, :].detach()
+        x_final_vals = x_backward_paths[:, -1, :].detach()
+
         # Determine which network to train based on current block
         block = (self.training_step_count // self.batches_per_block) % 2
         self.training_step_count += 1
@@ -433,9 +432,19 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
 
         if self.train_jointly:
             # ===== Joint Optimization =====
-            loss_fwd = self._compute_loss_forward(x_forward_interior, x_forward_bc)
-            loss_bwd = self._compute_loss_backward(x_backward_interior, x_backward_bc)
-            loss_total = loss_fwd + loss_bwd
+
+            # loglik loss 
+            # loss_loglik_init = self._compute_loglik_loss_jointly(x_init_vals)
+            # loss_loglik_final = self._compute_loglik_loss_jointly(x_final_vals)
+            # loss_loglik = self.loss_weights["loglik"] * (loss_loglik_init + loss_loglik_final)
+
+            loss_fwd, loss_fwd_pde, loss_fwd_bc = self._compute_loss_forward(
+                x_forward_paths, x_forward_bc
+            )
+            loss_bwd, loss_bwd_pde, loss_bwd_bc = self._compute_loss_backward(
+                x_backward_paths, x_backward_bc
+            )
+            loss_total = loss_fwd + loss_bwd # + loss_loglik
 
             opt_fwd.zero_grad()
             opt_bwd.zero_grad()
@@ -454,31 +463,105 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
                     # get lr with scheduler
                     "lr": opt_fwd.param_groups[0]["lr"],
                     "loss_total": loss_total,
-                    "loss_forward": loss_fwd,
-                    "loss_backward": loss_bwd,
+                    #"loss_loglik_init": loss_loglik_init,
+                    #"loss_loglik_final": loss_loglik_final,
+                    "loss_forward_pde": loss_fwd_pde,
+                    "loss_forward_bc": loss_fwd_bc,
+                    "loss_backward_pde": loss_bwd_pde,
+                    "loss_backward_bc": loss_bwd_bc,
                 },
                 prog_bar=True,
             )
         else:
             # ===== Blockwise Alternating Optimization =====
             if block == 0:
-                loss_fwd = self._compute_loss_forward(x_forward_interior, x_forward_bc)
+
+                # loglik loss
+                loss_loglik_forward = self.loss_weights["loglik"] *self._compute_loglik_loss_forward(x_final_vals)
+                assert False, "fix this first"
+                loss_fwd, loss_fwd_pde, loss_fwd_bc = self._compute_loss_backward(x_backward_paths, x_backward_bc)#self._compute_loss_forward(x_forward_paths, x_forward_bc)
 
                 opt_fwd.zero_grad()
                 self.manual_backward(loss_fwd)
                 opt_fwd.step()
 
-                self.log("loss_forward", loss_fwd, prog_bar=True)
-            else:
-                loss_bwd = self._compute_loss_backward(
-                    x_backward_interior, x_backward_bc
+                # step scheduler
+                schedulers = self.lr_schedulers()
+                if isinstance(schedulers, list):    
+                    schedulers[0].step()
+
+                self.log_dict(
+                    {
+                        "lr": opt_fwd.param_groups[0]["lr"],
+                        #"loss_fwd_total": loss_fwd + loss_loglik_forward,
+                        "loss_loglik_forward": loss_loglik_forward,
+                        #"loss_forward": loss_fwd,
+                        "loss_forward_pde": loss_fwd_pde,
+                        #"loss_forward_bc": loss_fwd_bc,
+                    },
+                    prog_bar=True,
                 )
+            else:
+                # loglik loss
+                loss_loglik_backward = self.loss_weights["loglik"] * self._compute_loglik_loss_backward(x_init_vals)
+
+                loss_bwd, loss_bwd_pde, loss_bwd_bc = self._compute_loss_forward(x_forward_paths, x_forward_bc)#self._compute_loss_backward(x_backward_paths, x_backward_bc)
 
                 opt_bwd.zero_grad()
                 self.manual_backward(loss_bwd)
                 opt_bwd.step()
 
-                self.log("loss_backward", loss_bwd, prog_bar=True)
+
+                # step scheduler
+                schedulers = self.lr_schedulers()
+                if isinstance(schedulers, list):    
+                    schedulers[1].step()
+
+                self.log_dict(
+                    {
+                        "lr": opt_bwd.param_groups[0]["lr"],
+                        #"loss_bwd_total": loss_bwd + loss_loglik_backward,
+                        "loss_loglik_backward": loss_loglik_backward,
+                        #"loss_backward": loss_bwd,
+                        "loss_backward_pde": loss_bwd_pde,
+                        #"loss_backward_bc": loss_bwd_bc,
+                    },
+                    prog_bar=True,
+                )
+
+    def _create_paths(self, batch, backward: bool):
+        if backward:
+            ansatz = self.backward_net
+            # we want an increasing time grid for the final path
+            time_grid_tensor = self.backward_net.time_grid_tensor.flip(dims=[0])
+            init_val_batch = batch["final_vals"]
+            noise = batch["backward_noise"]
+        else:
+            ansatz = self.forward_net
+            time_grid_tensor = self.forward_net.time_grid_tensor
+            init_val_batch = batch["init_vals"]
+            noise = batch["forward_noise"]
+        paths = ansatz.drift_sde_solution_func(init_val_batch, noise)
+        if backward:
+            paths = paths.flip(dims=[1])
+
+        if ansatz.prepend_time_grid:
+            time_grid = (
+                time_grid_tensor[None, :, None]
+                .expand(paths.shape[0], -1, -1)
+                .to(paths.device)
+            )
+            return torch.cat((time_grid, paths), dim=-1)
+        else:
+            return paths
+
+    def generate_paths_only(self, batch):
+        """Generate paths only without computing the loss."""
+        self.to(batch["init_vals"].device)
+        forward_paths = self._create_paths(batch, backward=False)
+        backward_paths = self._create_paths(batch, backward=True)
+
+        return forward_paths, backward_paths
 
     def _create_nn_ansatz(self, name: str, idx: int, backward: bool):
         return NNAnsatz(
@@ -497,6 +580,62 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
             idx=idx,
         )
 
+    def _compute_loss_forward(self, x_interior, x_bc):
+        """
+        Compute the loss for the forward model.
+        """
+        # Compute PDE residual
+        # pde_loss = self._compute_pde_loss_forward(x_interior.detach())
+        # dummy pde loss
+        pde_loss = torch.tensor(0.0, device=x_interior.device)
+
+        # Compute boundary condition loss
+        # bc_loss = self._compute_boundary_loss_forward(x_bc)
+
+        # Compute log likelihood loss (simple log likelihood)
+        # bc_loss = self._compute_naive_loglik_loss_forward(x_bc)
+
+        # Compute log likelihood loss (FBSDE loss)
+        bc_loss = self._compute_loglik_fbsde_loss_forward(x_interior)
+        
+        # dummy log likelihood loss
+        # bc_loss = torch.tensor(0.0, device=x_interior.device)
+
+        # Total loss
+        total_loss = (
+            self.loss_weights["pde"] * pde_loss + self.loss_weights["bc"] * bc_loss
+        )
+
+        return total_loss, pde_loss, bc_loss
+    
+    def _compute_loss_backward(self, x_interior, x_bc):
+        """
+        Compute the loss for the backward model.
+        """
+        # Compute PDE residual
+        # pde_loss = self._compute_pde_loss_backward(x_interior.detach())
+        # dummy pde loss
+        pde_loss = torch.tensor(0.0, device=x_interior.device)
+
+        # Compute boundary condition loss
+        # bc_loss = self._compute_boundary_loss_backward(x_bc)
+
+        # Compute log naive likelihood loss
+        # bc_loss = self._compute_naive_loglik_loss_backward(x_bc)
+
+        # Compute log likelihood loss (FBSDE loss)
+        # bc_loss = self._compute_loglik_fbsde_loss_backward(x_interior)
+
+        # dummy log likelihood loss
+        bc_loss = torch.tensor(0.0, device=x_interior.device)
+
+        # Total loss
+        total_loss = (
+            self.loss_weights["pde"] * pde_loss + self.loss_weights["bc"] * bc_loss
+        )
+
+        return total_loss, pde_loss, bc_loss
+    
     def _compute_boundary_loss_forward(self, x_bc):
         """
         Compute the boundary condition loss for the forward model.
@@ -510,19 +649,94 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
 
         bc_loss = torch.mean(bc_residual.pow(2))
         return bc_loss
-    
-    def _compute_loglik_loss_forward(self, x_bc):
+
+    def _compute_naive_loglik_loss_forward(self, x_bc):
         """
         Compute the log likelihood loss for the forward model. Assumes that x_bc is generated
         by the forward model gradient vector field at time T.
         """
-        
-        bc_loss = - torch.mean(self.log_p_T(x_bc[:, 1:]))
+
+        bc_loss = -torch.mean(self.log_p_T(x_bc[:, 1:]))
 
         return bc_loss
 
+    def _compute_loglik_fbsde_loss_forward(self, x_forward_paths):
+        """
+        Compute the log likelihood loss for the forward model based on the loss of Theorem 4.
+        Assumes knowledge of final distribution p_T.
+        """
+        # x_forward_paths is of shape (batch_size, nbr_time_steps, d+1)
+        # where the first dimension is time
+        # TODO: remove: x_forward_paths.requires_grad_(True)
+        u = self.forward_net(x_forward_paths)
+        u_hat = self.backward_net(x_forward_paths)
+
+        grad_u_t, grad_u_x, laplace_u = get_derivatives(u, x_forward_paths)
+
+        # x_forward_paths.requires_grad_(True)
+        grad_u_hat_t, grad_u_hat_x, laplace_u_hat = get_derivatives(u_hat, x_forward_paths)
+
+        dt = self.forward_net.time_grid_tensor[1:] - self.forward_net.time_grid_tensor[:-1]
+        g = self.g
+        # assert dt is only positive
+        assert torch.all(dt > 0) 
+        
+        integrand = 0.5*(grad_u_x+grad_u_hat_x).pow(2)+g**2 * laplace_u_hat
+        # integral = torch.sum(
+        #     # left endpoint Riemann sum
+        #     #integrand[:, :-1, :] * dt[None, :, None], dim=1
+        #     # right endpoint Riemann sum
+        #     # integrand[:, 1:, :] * dt[None, :, None], dim=1
+        # )
+        # trapezoidal rule
+        integral = torch.sum(
+            0.5 * (integrand[:, :-1, :] + integrand[:, 1:, :]) * dt[None, :, None], dim=1
+        )
+
+        loglik = self.log_p_T(x_forward_paths[:, -1, 1:])
+        # dummy log likelihood loss
+        # loglik = torch.zeros((x_forward_paths.shape[0], 1), device=x_forward_paths.device)
+        bc_loss = -loglik + integral
+        return bc_loss.mean()
+
+    def _compute_loglik_fbsde_loss_backward(self, x_backward_paths):
+        """
+        Compute the log likelihood loss for the backward model based on the loss of Theorem 4.
+        Assumes knowledge of initial distribution p_0.
+        """
+        # x_backward_paths is of shape (batch_size, nbr_time_steps, d+1)
+        # where the first dimension is time
+        u_hat = self.backward_net(x_backward_paths)
+        u = self.forward_net(x_backward_paths)
+
+        grad_u_hat_t, grad_u_hat_x, laplace_u_hat = get_derivatives(u_hat, x_backward_paths)
+        # x_backward_paths.requires_grad_(True)
+        grad_u_t, grad_u_x, laplace_u = get_derivatives(u, x_backward_paths)
+        dt = self.backward_net.time_grid_tensor[1:] - self.backward_net.time_grid_tensor[:-1]
+        g = self.g
+        # assert dt is only negative
+        assert torch.all(dt < 0)
+        dt = torch.abs(dt)
+        integrand = 0.5 * (grad_u_x + grad_u_hat_x).pow(2) + g**2 * laplace_u
+        # integral = torch.sum(
+        #     # left endpoint Riemann sum (since last step is final distribution)
+        #     integrand[:, :-1, :] * dt[None, :, None], dim=
+        #     # right endpoint Riemann sum
+        #     #integrand[:, 1:, :] * dt[None, :, None], dim=1
+        # )
+        # trapezoidal rule
+        integral = torch.sum(
+            0.5 * (integrand[:, :-1, :] + integrand[:, 1:, :]) * dt[None, :, None], dim=1
+        )
+        loglik = self.log_p_0(x_backward_paths[:, 0, 1:])
+        # dummy log likelihood loss
+        # loglik = torch.zeros((x_backward_paths.shape[0], 1), device=x_backward_paths.device)
+        bc_loss = -loglik + integral
+        return bc_loss.mean()
+
     def _compute_pde_loss_forward(self, x_interior):
         # x_interior is of shape (batch_size, d+1) where the first dimension is time
+        assert x_interior.is_leaf, "x_interior must be a leaf tensor."
         x_interior.requires_grad_(True)
         u = self.forward_net(x_interior)
 
@@ -537,27 +751,9 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         pde_loss = torch.mean(pde_residual.pow(2))
         return pde_loss
 
-    def _compute_loss_forward(self, x_interior, x_bc):
-        """
-        Compute the loss for the forward model.
-        """
-        # Compute PDE residual
-        pde_loss = self._compute_pde_loss_forward(x_interior)
-
-        # Compute boundary condition loss
-        # bc_loss = self._compute_boundary_loss_forward(x_bc)
-
-        # Compute log likelihood loss
-        bc_loss = self._compute_loglik_loss_forward(x_bc)
-
-        # Total loss
-        total_loss = (
-            self.loss_weights["pde"] * pde_loss + self.loss_weights["bc"] * bc_loss
-        )
-
-        return total_loss
 
     def _compute_pde_loss_backward(self, x_interior):
+        assert x_interior.is_leaf, "x_interior must be a leaf tensor."
         x_interior.requires_grad_(True)
         u = self.backward_net(x_interior)
 
@@ -586,32 +782,119 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         bc_loss = torch.mean(bc_residual.pow(2))
         return bc_loss
 
-    def _compute_loglik_loss_backward(self, x_bc):
+    def _compute_naive_loglik_loss_backward(self, x_bc):
         """
         Compute the log likelihood loss for the backward model. Assumes that x_bc is generated
         by the backward model gradient vector field at time 0.
         """
-        
-        bc_loss = - torch.mean(self.log_p_0(x_bc[:, 1:]))
+
+        bc_loss = -torch.mean(self.log_p_0(x_bc[:, 1:]))
 
         return bc_loss
+
+    def _compute_loglik_loss_jointly(self, x_boundary_vals, constrained=True):
+        """
+        Compute the log likelihood loss.
+        """
+        # x_bc is of shape (batch_size, d+1) where the first dimension is time
+        # we assume that x_bc is generated by the backward model gradient vector field at time 0
+        # and we want to compute the log likelihood of the initial distribution p_0
+        loglik = self.forward_net(x_boundary_vals) + self.backward_net(x_boundary_vals) 
+        t = x_boundary_vals[0, 0]
+        if constrained:
+            # make sure the sum is a density by integration 
+            grid = torch.linspace(
+                self.domain_extrema[0], self.domain_extrema[1], steps=100
+            ).to(x_boundary_vals.device)
+            # concatenate time of boundary values with grid
+            grid = torch.cat(
+                (
+                    t.unsqueeze(0).repeat(grid.shape[0], 1),
+                    grid.reshape(-1, 1),
+                ),
+                dim=-1,
+            )
+            
+            # intergrate the likelihood over the grid
+            integral = torch.trapezoid(
+                torch.exp(self.forward_net(grid)+self.backward_net(grid)).squeeze(1), x = grid[:, 1], dim=-1
+            )
+            residue = (torch.sum(integral)-1.0).pow(2)
+            #residue = torch.sum(integral) - 1.0
+        else:
+            residue = torch.tensor(0.0, device=x_boundary_vals.device)
+
+        loglik = loglik.mean()
+
+        return -loglik + residue
     
-    def _compute_loss_backward(self, x_interior, x_bc):
+    def _compute_loglik_loss_forward(self, x_final_vals, constrained=True):
         """
-        Compute the loss for the backward model.
+        Compute the log likelihood loss for the forward model.
         """
-        # Compute PDE residual
-        pde_loss = self._compute_pde_loss_backward(x_interior)
+        # x_final_vals is of shape (batch_size, d+1) where the first dimension is time = 1
 
-        # Compute boundary condition loss
-        # bc_loss = self._compute_boundary_loss_backward(x_bc)
+        loglik = self.forward_net(x_final_vals) #+ self.backward_net(x_final_vals)
+        t = x_final_vals[0, 0]
+        if constrained:
+            # make sure the sum is a density by integration 
+            grid = torch.linspace(
+                self.domain_extrema[0], self.domain_extrema[1], steps=100
+            ).to(x_final_vals.device)
+            # concatenate time of boundary values with grid
+            grid = torch.cat(
+                (
+                    t.unsqueeze(0).repeat(grid.shape[0], 1),
+                    grid.reshape(-1, 1),
+                ),
+                dim=-1,
+            )
+            
+            # intergrate the likelihood over the grid
+            integral = torch.trapezoid(
+                torch.exp(self.forward_net(grid)+self.backward_net(grid)).squeeze(1), x = grid[:, 1], dim=-1
+            )
+            residue = (torch.sum(integral)-1.0).pow(2)
+            #residue = torch.sum(integral) - 1.0
+        else:
+            residue = torch.tensor(0.0, device=x_final_vals.device)
 
-        # Compute log likelihood loss
-        bc_loss = self._compute_loglik_loss_backward(x_bc)
+        loglik = loglik.mean()
 
-        # Total loss
-        total_loss = (
-            self.loss_weights["pde"] * pde_loss + self.loss_weights["bc"] * bc_loss
-        )
+        return -loglik + residue
 
-        return total_loss
+    def _compute_loglik_loss_backward(self, x_init_vals, constrained=True):
+        """
+        Compute the log likelihood loss for the backward model.
+        """
+        # x_init_vals is of shape (batch_size, d+1) where the first dimension is time = 0
+
+        loglik = self.backward_net(x_init_vals)
+        t = x_init_vals[0, 0]
+        if constrained:
+            # make sure the sum is a density by integration 
+            grid = torch.linspace(
+                self.domain_extrema[0], self.domain_extrema[1], steps=100
+            ).to(x_init_vals.device)
+            # concatenate time of boundary values with grid
+            grid = torch.cat(
+                (
+                    t.unsqueeze(0).repeat(grid.shape[0], 1),
+                    grid.reshape(-1, 1),
+                ),
+                dim=-1,
+            )
+            
+            # intergrate the likelihood over the grid
+            integral = torch.trapezoid(
+                torch.exp(self.forward_net(grid)+self.backward_net(grid)).squeeze(1), x = grid[:, 1], dim=-1
+            )
+            residue = (torch.sum(integral)-1.0).pow(2)
+            #residue = torch.sum(integral) - 1.0
+        else:
+            residue = torch.tensor(0.0, device=x_init_vals.device)
+
+        loglik = loglik.mean()
+        return -loglik + residue
+
+   

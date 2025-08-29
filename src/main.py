@@ -8,10 +8,10 @@ torch.set_float32_matmul_precision("medium")
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from datasets import (
-    DriftPathDataset,
     ForwardBackwardDataloader,
-    ForwardBackwardDataset,
+    ForwardBackwardNoiseDataset,
     GaussianDataset,
+    GaussianMixtureDataset,
 )
 
 from utils import (
@@ -29,17 +29,25 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 debug_fast = False
 load_final_models = False
-project_to_load_models_from = "2025-08-07_18-29-38"  # good transport from mu=3 to 0
+project_to_load_models_from = (
+    "2025-08-08_14-40-18"  # likelihood transport from mu=3 to 0
+)
+# "2025-08-07_18-29-38"  # good transport from mu=3 to 0
 # "2025-08-07_18-22-49" # bad transport from mu=5 to mu=0
 # "2025-08-07_17-32-09" # good transport from mu=1 to mu=0
 # "2025-08-07_12-59-10"
+
+# Meeting Matthias
+# as in paper, transport from mu=5 to mu=0
+# artifacts/schroedinger_bridge/2025-08-13_12-34-25/plots/paths.png
+
+
 checkpointing = False
 ckpt_interval = 1000  # steps
 
 if __name__ == "__main__":
     # multiprocessing for data loading
     torch.multiprocessing.set_start_method("spawn")
-    torch.autograd.set_detect_anomaly(True)
 
     num_workers = 0
 
@@ -57,15 +65,15 @@ if __name__ == "__main__":
     differentiate_through_drift = True
 
     # specify initial and final distributions for Gaussian dataset
-    mean_init = torch.Tensor([3.0])
-    cov_init = torch.tensor([[1.0]])
+    mean_init = torch.Tensor([5.0])
+    cov_init = torch.tensor([1.0])
     mean_final = torch.Tensor([0.0])
     cov_final = torch.tensor([[1.0]])
 
     # parameters
     d = 1
     T = 1
-    nbr_time_steps = 10
+    nbr_time_steps = 10#30
     domain_extrema = torch.tensor([-10.0, 10.0])
     time_grid_tensor = torch.linspace(0, T, nbr_time_steps + 1)
     constants = {
@@ -80,7 +88,7 @@ if __name__ == "__main__":
     output_dimension = 1
     n_hidden_layers = 5
     hidden_size = d + 100
-    activation = nn.Sigmoid()  # nn.Softplus() #nn.GELU() #ReLU2() #  # nn.Tanh
+    activation = nn.Sigmoid() #nn.GELU()   # nn.Softplus()  #ReLU2() #  # nn.Tanh
     network_params = {
         "input_dimension": input_dimension,
         "output_dimension": output_dimension,
@@ -92,16 +100,14 @@ if __name__ == "__main__":
     # train parameters
     learning_rate = 0.01
     batch_size = 1000  # 60000
-    batches_per_block = 10
-    train_steps = 10000  # 10**4
-    block_steps = 10
+    batches_per_block = 100
+    train_steps = 4000  # 10**4
     train_jointly = True
     train_params = {
         "learning_rate": learning_rate,
         "batch_size": batch_size,
         "batches_per_block": batches_per_block,
         "train_steps": train_steps,
-        "block_steps": block_steps,
         "train_jointly": train_jointly,
     }
 
@@ -115,18 +121,37 @@ if __name__ == "__main__":
         batch_size = 1000
         train_steps = 10**1
 
-    init_val_dataset = GaussianDataset(
-        mean=mean_init,
-        cov=cov_init,
-        dim=d,
+    # init_val_dataset = GaussianDataset(
+    #     mean=mean_init,
+    #     cov=cov_init,
+    #     dim=d,
+    #     batch_size=batch_size,
+    # )
+
+    init_val_dataset = GaussianMixtureDataset(
+        means_list=[mean_init, -mean_init],
+        covs_list=[cov_init, cov_init],
+        weights=[0.5, 0.5],
         batch_size=batch_size,
     )
+
     final_val_dataset = GaussianDataset(
         mean=mean_final,
         cov=cov_final,
         dim=d,
         batch_size=batch_size,
     )
+    dataset = ForwardBackwardNoiseDataset(
+        init_val_dataset=init_val_dataset,
+        final_val_dataset=final_val_dataset,
+        n_time_steps=nbr_time_steps,
+        batch_size=batch_size,
+        dim=d,
+    )
+
+    # create dataloader
+    dataloader = ForwardBackwardDataloader(dataset)
+
     # forward_path_dataset = BMPathDataset(
     #     init_val_dataset=init_val_dataset,
     #     T=T,
@@ -157,29 +182,6 @@ if __name__ == "__main__":
             train_jointly=train_jointly,
         )
 
-        forward_path_dataset = DriftPathDataset(
-            init_val_dataset=init_val_dataset,
-            T=T,
-            time_steps=nbr_time_steps,
-            drift_func=model_sb_pinn.forward_net.drift_sde_solution_func,
-        )
-
-        backward_path_dataset = DriftPathDataset(
-            init_val_dataset=final_val_dataset,
-            T=T,
-            time_steps=nbr_time_steps,
-            drift_func=model_sb_pinn.backward_net.drift_sde_solution_func,
-            backward_paths=True,
-        )
-
-        dataset = ForwardBackwardDataset(
-            forward_dataset=forward_path_dataset,
-            backward_dataset=backward_path_dataset,
-        )
-
-        # create dataloader
-        dataloader = ForwardBackwardDataloader(dataset)
-
         # Define callbacks
         checkpoint_callback = ModelCheckpoint(
             dirpath=ckpt_dir,
@@ -208,10 +210,13 @@ if __name__ == "__main__":
             print(f"Best model saved at: {best_model_path}")
 
         # save final model
-        final_model_path = f"{ckpt_dir}/model-final-step={trainer.global_step:06d}-loss={trainer.callback_metrics.get('loss_total'):.4f}.ckpt"
+        total_loss = trainer.callback_metrics.get("loss_total", None)
+        if total_loss is None:
+            total_loss = trainer.callback_metrics.get("loss_forward", 0) + trainer.callback_metrics.get("loss_backward", 0)
+        final_model_path = f"{ckpt_dir}/model-final-step={trainer.global_step:06d}-loss={total_loss:.4f}.ckpt"
         os.makedirs(ckpt_dir, exist_ok=True)
         trainer.save_checkpoint(
-            f"{ckpt_dir}/model-final-step={trainer.global_step:06d}-loss={trainer.callback_metrics.get('loss_total'):.4f}.ckpt"
+            f"{ckpt_dir}/model-final-step={trainer.global_step:06d}-loss={total_loss:.4f}.ckpt"
         )
         print(f"Final model saved at: {final_model_path}")
 
@@ -231,9 +236,8 @@ if __name__ == "__main__":
             nbr_grid_points=100,
             constants=constants,
         )
-        print(f"Saving plot to {artifacts_dir}/plots/round_final/forward_final.png")
-        os.makedirs(f"{artifacts_dir}/plots/round_final", exist_ok=True)
-        fig.savefig(f"{artifacts_dir}/plots/round_final/forward_final.png")
+        print(f"Saving plot to {artifacts_dir}/plots/models_final.png")
+        fig.savefig(f"{artifacts_dir}/plots/models_final.png")
     else:
         print("Skipping plotting for d > 2, as it is not implemented.")
 
@@ -242,26 +246,9 @@ if __name__ == "__main__":
     # normal distribution in d dimensions
     # get brownian motion up to time T
 
-    simulation_data_forward = DriftPathDataset(
-        init_val_dataset=init_val_dataset,
-        T=T,
-        time_steps=nbr_time_steps,
-        drift_func=model_sb_pinn.forward_net.drift_sde_solution_func,
-    )
-
-    simulation_data_backward = DriftPathDataset(
-        init_val_dataset=final_val_dataset,
-        T=T,
-        time_steps=nbr_time_steps,
-        drift_func=model_sb_pinn.backward_net.drift_sde_solution_func,
-        backward_paths=True,
-    )
-
     # plot 100 paths
     print("Plotting 100 paths from prior...")
-    fig, ax = plot_paths_from_prior_and_final(
-        simulation_data_forward, simulation_data_backward, constants
-    )
+    fig, ax = plot_paths_from_prior_and_final(model_sb_pinn, dataset, constants)
     print(f"Saving plot to {artifacts_dir}/plots/paths.png")
     fig.savefig(f"{artifacts_dir}/plots/paths.png")
     print("Done.")
