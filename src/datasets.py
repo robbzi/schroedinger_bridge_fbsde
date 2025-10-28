@@ -90,11 +90,18 @@ class CircleDistribution2D(torch.distributions.Distribution):
         return torch.stack((x, y), dim=-1) + noise
 
 class CrossDistribution2D(torch.distributions.Distribution):
-    def __init__(self, offset: float = 2.0, noise_var: float = 0.1, device: torch.device = torch.device("cuda")):
+    """
+    Generates samples from a cross shape in 2D:
+    Two diagonal lines crossing at the origin
+    """
+    def __init__(self, length=10, noise_var: float = 0.05, device: torch.device = torch.device("cuda")):
         super().__init__()
-        self.offset = offset
+        self.length = length
         self.noise_var = noise_var
         self.device = device
+
+        #automatic recasting to 2d shape 
+        self._event_shape = torch.Size((2,))
 
     def sample(self, sample_shape = torch.Size()) -> torch.Tensor:
         """
@@ -102,12 +109,21 @@ class CrossDistribution2D(torch.distributions.Distribution):
         samples if the distribution parameters are batched.
         """
         shape = self._extended_shape(sample_shape)
-        choices = torch.randint(0, 2, shape, device=self.device)
+        half_size = shape[0] // 2
+        # First half along y = x + offset
+        x1 = torch.rand(half_size, device=self.device) * self.length - self.length/2 
+        y1 = x1
+        # Second half along y = -x - offset
+        x2 = torch.rand(shape[0] - half_size, device=self.device) * self.length - self.length/2
+        y2 = -x2
+        x = torch.cat((x1, x2), dim=0)
+        y = torch.cat((y1, y2), dim=0)
         noise = torch.randn(shape, device=self.device) * self.noise_var**0.5
-        x = torch.where(choices == 0, torch.randn(shape, device=self.device) * self.noise_var**0.5, torch.full(shape, self.offset, device=self.device) + noise)
-        y = torch.where(choices == 1, torch.randn(shape, device=self.device) * self.noise_var**0.5, torch.full(shape, self.offset, device=self.device) + noise)
-        return torch.stack((x, y), dim=-1)
-    
+        out_unshuffled = torch.stack((x, y), dim=-1) + noise
+        #shuffle to mix the two lines
+        indices = torch.randperm(shape[0], device=self.device)
+        return out_unshuffled[indices]
+        
 class Dataset2D(InitValDataset):
     def __init__(self, distribution: torch.distributions.Distribution, batch_size: int):
         super().__init__(

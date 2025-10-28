@@ -17,6 +17,7 @@ from datasets import (
     Dataset2D,
     GaussianMixtureDataset,
     CircleDistribution2D,
+    CrossDistribution2D,
 )
 
 from utils import (
@@ -33,8 +34,9 @@ assert torch.cuda.is_available()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 debug_fast = False
-load_final_models = True
+load_final_models = False
 project_to_load_models_from = (
+    #"2025-10-28_17-44-10" #<-- good circle with all the paths 100 to 1000
     "2025-10-28_16-38-58" #<-- THIS is the good circle one
     #"2025-10-28_15-13-17"
 )
@@ -121,7 +123,8 @@ if __name__ == "__main__":
         train_steps = 10**1
 
     init_val_dataset = Dataset2D(
-        distribution=CircleDistribution2D(radius=5.0),
+        #distribution=CircleDistribution2D(radius=5.0),
+        distribution=CrossDistribution2D(),
         batch_size=batch_size,
     )
 
@@ -238,14 +241,19 @@ if __name__ == "__main__":
     # get brownian motion up to time T
 
     # plot 100 paths
-    if d <= 2:
-        print("Plotting paths from prior...")
-        if d == 1:
-            fig, ax = plot_paths_1d_from_prior_and_final(model_sb, dataset, constants)
-        elif d == 2:
-            fig, ax = plot_paths_2d_from_prior_and_final(
-                model_sb, dataset, constants, max_nbr_paths=200, max_timesteps=4, horizontal=False
-            )
-        print(f"Saving plot to {artifacts_dir}/plots/paths.png")
-        fig.savefig(f"{artifacts_dir}/plots/paths.png")
-        print("Done.")
+    paths_to_plot = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+    for paths in paths_to_plot:
+        if d <= 2:
+            print("Plotting {paths} paths from prior...")
+            if d == 1:
+                fig, ax = plot_paths_1d_from_prior_and_final(model_sb, dataset, constants)
+            elif d == 2:
+                fig, ax = plot_paths_2d_from_prior_and_final(
+                    model_sb, dataset, constants, max_nbr_paths=paths, max_timesteps=4, horizontal=False
+                )
+            print(f"Saving plot to {artifacts_dir}/plots/paths_{paths}.png")
+            fig.savefig(f"{artifacts_dir}/plots/paths_{paths}.png")
+            #save as svg and pdf
+            fig.savefig(f"{artifacts_dir}/plots/paths_{paths}.svg")
+            fig.savefig(f"{artifacts_dir}/plots/paths_{paths}.pdf")
+            print("Done.")
