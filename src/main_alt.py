@@ -100,7 +100,7 @@ if __name__ == "__main__":
     batch_size = 1000  # 60000
     batches_per_block = 100
     alt_refresh_rate = 10
-    train_steps = 1000  # 10**4
+    train_steps = 10000  # 10**4
     train_jointly = False
     train_params = {
         "learning_rate": learning_rate,

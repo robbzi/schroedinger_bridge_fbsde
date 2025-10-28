@@ -134,6 +134,9 @@ def plot_paths_2d_from_prior_and_final(
     for ax_row in axs:
         for ax in ax_row:
             ax.set_aspect('equal', 'box')
+            # Set limits based on domain extrema
+            ax.set_xlim(constants["domain_extrema"][0].item(), constants["domain_extrema"][1].item())
+            ax.set_ylim(constants["domain_extrema"][0].item(), constants["domain_extrema"][1].item())
 
     # get batch
     batch = next(iter(dataset))

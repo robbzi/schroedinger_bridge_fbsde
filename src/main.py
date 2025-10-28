@@ -34,10 +34,11 @@ assert torch.cuda.is_available()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 debug_fast = False
-load_final_models = False
+load_final_models = True
 project_to_load_models_from = (
+    "2025-10-28_17-46-32" #<-- ok cross
     #"2025-10-28_17-44-10" #<-- good circle with all the paths 100 to 1000
-    "2025-10-28_16-38-58" #<-- THIS is the good circle one
+    #"2025-10-28_16-38-58" #<-- THIS is the good circle one
     #"2025-10-28_15-13-17"
 )
 
@@ -74,7 +75,7 @@ if __name__ == "__main__":
     d = 2
     T = 1
     nbr_time_steps = 100#30
-    domain_extrema = torch.tensor([-10.0, 10.0])
+    domain_extrema = torch.tensor([-6.0, 6.0])
     time_grid_tensor = torch.linspace(0, T, nbr_time_steps + 1)
     constants = {
         "d": d,
@@ -244,7 +245,7 @@ if __name__ == "__main__":
     paths_to_plot = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
     for paths in paths_to_plot:
         if d <= 2:
-            print("Plotting {paths} paths from prior...")
+            print(f"Plotting {paths} paths from prior...")
             if d == 1:
                 fig, ax = plot_paths_1d_from_prior_and_final(model_sb, dataset, constants)
             elif d == 2:
