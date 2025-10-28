@@ -423,6 +423,7 @@ class LitSchroedingerBridgeFBSDE(pl.LightningModule):
         prior_distribution: Optional[torch.distributions.Distribution] = None,
         batch_normalization: bool = False,
         train_jointly: bool = True,
+        alt_refresh_rate: int = 1,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["activation"])
@@ -443,6 +444,7 @@ class LitSchroedingerBridgeFBSDE(pl.LightningModule):
         self.differentiate_through_drift = differentiate_through_drift
         self.batch_normalization = batch_normalization
         self.train_jointly = train_jointly
+        self.alt_refresh_rate = alt_refresh_rate
 
         self.prior_distribution = prior_distribution
 
@@ -458,6 +460,9 @@ class LitSchroedingerBridgeFBSDE(pl.LightningModule):
         self.epoch_count = 0
 
         self.decay_rate = 0.995
+
+        self.path_buffer_forward = None
+        self.path_buffer_backward = None
 
         # TODO: this should be defined externally
         self.g = 1.0  # diffusion coefficient
@@ -552,49 +557,25 @@ class LitSchroedingerBridgeFBSDE(pl.LightningModule):
         else:
             # Determine which network to train based on current block
             block = (self.training_step_count // self.batches_per_block) % 2
-            self.training_step_count += 1
-            if self.training_step_count % self.batches_per_block == 0:
-                self.block_count += 1
-                if self.block_count % 2 == 0:
-                    self.epoch_count += 1
             # ===== Blockwise Alternating Optimization =====
             if block == 0:
+                if (self.training_step_count % self.batches_per_block) % self.alt_refresh_rate == 0:
+                    x_forward_paths = self._create_paths(batch, backward=False)
 
-                # loglik loss
-                loss_loglik_forward = self.loss_weights["loglik"] *self._compute_loglik_loss_forward(x_final_vals)
-                assert False, "fix this first"
-                loss_fwd, loss_fwd_pde, loss_fwd_bc = self._compute_alt_loss_backward(x_backward_paths, x_backward_bc)#self._compute_loss_forward(x_forward_paths, x_forward_bc)
+                    if not self.differentiate_through_drift:
+                        x_forward_paths = x_forward_paths.detach()
+                        x_forward_paths.requires_grad = True
+                    self.path_buffer_forward = x_forward_paths
+                else:
+                    x_forward_paths = self.path_buffer_forward
+                
 
-                opt_fwd.zero_grad()
-                self.manual_backward(loss_fwd)
-                opt_fwd.step()
-
-                # step scheduler
-                schedulers = self.lr_schedulers()
-                if isinstance(schedulers, list):    
-                    schedulers[0].step()
-
-                self.log_dict(
-                    {
-                        "lr": opt_fwd.param_groups[0]["lr"],
-                        #"loss_fwd_total": loss_fwd + loss_loglik_forward,
-                        "loss_loglik_forward": loss_loglik_forward,
-                        #"loss_forward": loss_fwd,
-                        "loss_forward_pde": loss_fwd_pde,
-                        #"loss_forward_bc": loss_fwd_bc,
-                    },
-                    prog_bar=True,
-                )
-            else:
-                # loglik loss
-                loss_loglik_backward = self.loss_weights["loglik"] * self._compute_loglik_loss_backward(x_init_vals)
-
-                loss_bwd, loss_bwd_pde, loss_bwd_bc = self._compute_alt_loss_forward(x_forward_paths, x_forward_bc)#self._compute_loss_backward(x_backward_paths, x_backward_bc)
+                alt_loss_backward = self._compute_alt_loss_backward(x_forward_paths)
 
                 opt_bwd.zero_grad()
-                self.manual_backward(loss_bwd)
+                self.manual_backward(alt_loss_backward)
+                torch.nn.utils.clip_grad_norm_(self.backward_net.parameters(), 1.0)
                 opt_bwd.step()
-
 
                 # step scheduler
                 schedulers = self.lr_schedulers()
@@ -604,14 +585,48 @@ class LitSchroedingerBridgeFBSDE(pl.LightningModule):
                 self.log_dict(
                     {
                         "lr": opt_bwd.param_groups[0]["lr"],
-                        #"loss_bwd_total": loss_bwd + loss_loglik_backward,
-                        "loss_loglik_backward": loss_loglik_backward,
-                        #"loss_backward": loss_bwd,
-                        "loss_backward_pde": loss_bwd_pde,
-                        #"loss_backward_bc": loss_bwd_bc,
+                        "loss_backward": alt_loss_backward,
                     },
                     prog_bar=True,
                 )
+            else:
+                if (self.training_step_count % self.batches_per_block) % self.alt_refresh_rate == 0:
+                    x_backward_paths = self._create_paths(batch, backward=True)
+
+                    if not self.differentiate_through_drift:
+                        x_backward_paths = x_backward_paths.detach()
+                        x_backward_paths.requires_grad = True
+
+                    self.path_buffer_backward = x_backward_paths
+                else:
+                    x_backward_paths = self.path_buffer_backward
+                
+                alt_loss_forward = self._compute_alt_loss_forward(x_backward_paths)
+                
+                opt_fwd.zero_grad()
+                self.manual_backward(alt_loss_forward)
+                torch.nn.utils.clip_grad_norm_(self.forward_net.parameters(), 1.0)
+                opt_fwd.step()
+                
+                # step scheduler
+                schedulers = self.lr_schedulers()
+                if isinstance(schedulers, list):    
+                    schedulers[0].step()
+
+                self.log_dict(
+                    {
+                        "lr": opt_fwd.param_groups[0]["lr"],
+                        "loss_forward": alt_loss_forward,
+                    },
+                    prog_bar=True,
+                )
+
+            self.training_step_count += 1
+            if self.training_step_count % self.batches_per_block == 0:
+                self.block_count += 1
+                if self.block_count % 2 == 0:
+                    self.epoch_count += 1
+
 
     def _create_paths(self, batch, backward: bool):
         if backward:
@@ -671,10 +686,9 @@ class LitSchroedingerBridgeFBSDE(pl.LightningModule):
         assert self.prior_distribution is not None, "Prior distribution must be provided for joint loss computation."
 
         batch_size = x_interior.shape[0]
-        dt = self.forward_net.time_grid_tensor[1:] - self.forward_net.time_grid_tensor[:-1]
 
         # divergence of backward net
-        z_hat, div_z_hat = self.backward_net.forward_and_divergence(x_interior, create_graph=self.differentiate_through_drift)
+        z_hat, div_z_hat = self.backward_net.forward_and_divergence(x_interior, create_graph=True)
         z = self.forward_net(x_interior)
         loss = 0.5*(z+z_hat).pow(2) + self.g*div_z_hat
         loss = (self.dt*loss).sum() / batch_size
@@ -682,51 +696,35 @@ class LitSchroedingerBridgeFBSDE(pl.LightningModule):
 
         return loss
 
+    def _compute_alt_loss_backward(self, x_interior):
+        """
+        Compute the loss for the backward model.
+        """
+
+        batch_size = x_interior.shape[0]
+
+        # divergence of backward net
+        z_hat, div_z_hat = self.backward_net.forward_and_divergence(x_interior, create_graph=True)
+        z = self.forward_net(x_interior)
+        loss = 0.5*(z_hat).pow(2) + self.g*div_z_hat + z*z_hat
+        loss = (self.dt*loss).sum() / batch_size
+        assert not torch.isnan(loss), "Loss is NaN."
+        return loss 
+    
     def _compute_alt_loss_forward(self, x_interior):
         """
         Compute the loss for the forward model.
         """
-
         batch_size = x_interior.shape[0]
-        dt = self.forward_net.time_grid_tensor[1:] - self.forward_net.time_grid_tensor[:-1]
 
-        # divergence of backward net
-        z_hat, div_z_hat = self.backward_net.forward_and_divergence(x_interior, create_graph=self.differentiate_through_drift)
-        z = self.forward_net(x_interior)
-        loss = 0.5*(z_hat).pow(2) + self.g*div_z_hat + z*z_hat
+        # divergence of forward net
+        z, div_z = self.forward_net.forward_and_divergence(x_interior, create_graph=True)
+        z_hat = self.backward_net(x_interior)
+        loss = 0.5*(z).pow(2) + self.g*div_z + z*z_hat
         loss = (self.dt*loss).sum() / batch_size
-        loss = loss - self.prior_distribution.log_prob(x_interior[:, -1, 1:]).mean()
         assert not torch.isnan(loss), "Loss is NaN."
-        return loss 
-    
-    def _compute_alt_loss_backward(self, x_interior, x_bc):
-        """
-        Compute the loss for the backward model.
-        """
-        # Compute PDE residual
-        # pde_loss = self._compute_pde_loss_backward(x_interior.detach())
-        # dummy pde loss
-        pde_loss = torch.tensor(0.0, device=x_interior.device)
+        return loss
 
-        # Compute boundary condition loss
-        # bc_loss = self._compute_boundary_loss_backward(x_bc)
-
-        # Compute log naive likelihood loss
-        # bc_loss = self._compute_naive_loglik_loss_backward(x_bc)
-
-        # Compute log likelihood loss (FBSDE loss)
-        # bc_loss = self._compute_loglik_fbsde_loss_backward(x_interior)
-
-        # dummy log likelihood loss
-        bc_loss = torch.tensor(0.0, device=x_interior.device)
-
-        # Total loss
-        total_loss = (
-            self.loss_weights["pde"] * pde_loss + self.loss_weights["bc"] * bc_loss
-        )
-
-        return total_loss, pde_loss, bc_loss
-    
     def _compute_boundary_loss_forward(self, x_bc):
         """
         Compute the boundary condition loss for the forward model.
