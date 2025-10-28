@@ -149,3 +149,13 @@ def get_derivatives(u, x_interior):
         outputs=grad_u_x.sum(), inputs=x_interior, create_graph=True
     )[0][:, :, 1:]
     return grad_u_t, grad_u_x, laplace_u
+
+def time_positional_embedding(t, time_embed_dim, freq_scale=10000):
+
+    assert time_embed_dim % 2 == 0, "time_embed_dim must be even"
+    device = t.device
+    m = time_embed_dim // 2
+    f_m = torch.exp(-torch.arange(0, m, dtype=torch.float32)*torch.log(torch.tensor(freq_scale))/m).to(device)
+    args = t[..., None] * f_m.view((1,) * t.dim() + (-1,)) # shape (..., m)
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    return embedding

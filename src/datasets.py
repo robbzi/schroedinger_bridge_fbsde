@@ -19,6 +19,18 @@ class InitValDataset(IterableDataset):
     def __iter__(self):
         return iter(self.generate())
 
+class PriorDataset(InitValDataset):
+    def __init__(
+        self, prior_distribution: torch.distributions.Distribution, batch_size: int
+    ):
+        super().__init__(
+            init_val_distribution=prior_distribution,
+            batch_size=batch_size,
+        )
+    
+    def log_prob(self, samples: torch.Tensor) -> torch.Tensor:
+        return self.init_val_distribution.log_prob(samples)
+
 
 class GaussianDataset(InitValDataset):
     def __init__(
@@ -30,10 +42,76 @@ class GaussianDataset(InitValDataset):
         self.cov = cov
         self.dim = dim
         self.batch_size = batch_size
-        super().__init__(
+        InitValDataset.__init__(
+            self,
             init_val_distribution=MultivariateNormal(
                 loc=self.mean.to("cuda"), covariance_matrix=self.cov.to("cuda")
             ),
+            batch_size=batch_size,
+        )
+
+class GaussianPriorDataset(GaussianDataset, PriorDataset):
+    def __init__(
+        self, mean: torch.Tensor, cov: torch.Tensor, dim: int, batch_size: int
+    ):
+        GaussianDataset.__init__(
+            self,
+            mean=mean,
+            cov=cov,
+            dim=dim,
+            batch_size=batch_size,
+        )
+        PriorDataset.__init__(
+            self,
+            prior_distribution=self.init_val_distribution,
+            batch_size=batch_size,
+        )
+
+class CircleDistribution2D(torch.distributions.Distribution):
+    def __init__(self, radius: float = 1, noise_var: float = 0.1, device: torch.device = torch.device("cuda")):
+        super().__init__()
+        self.radius = radius
+        self.noise_var = noise_var
+        self.device = device
+
+        #automatic recasting to 2d shape 
+        self._event_shape = torch.Size((2,))
+
+    def sample(self, sample_shape = torch.Size()) -> torch.Tensor:
+        """
+        Generates a sample_shape shaped sample or sample_shape shaped batch of
+        samples if the distribution parameters are batched.
+        """
+        shape = self._extended_shape(sample_shape)
+        angles = torch.rand(shape[0], device=self.device) * 2 * torch.pi
+        noise = torch.randn(shape, device=self.device) * self.noise_var**0.5
+        x = self.radius * torch.cos(angles)
+        y = self.radius * torch.sin(angles)
+        return torch.stack((x, y), dim=-1) + noise
+
+class CrossDistribution2D(torch.distributions.Distribution):
+    def __init__(self, offset: float = 2.0, noise_var: float = 0.1, device: torch.device = torch.device("cuda")):
+        super().__init__()
+        self.offset = offset
+        self.noise_var = noise_var
+        self.device = device
+
+    def sample(self, sample_shape = torch.Size()) -> torch.Tensor:
+        """
+        Generates a sample_shape shaped sample or sample_shape shaped batch of
+        samples if the distribution parameters are batched.
+        """
+        shape = self._extended_shape(sample_shape)
+        choices = torch.randint(0, 2, shape, device=self.device)
+        noise = torch.randn(shape, device=self.device) * self.noise_var**0.5
+        x = torch.where(choices == 0, torch.randn(shape, device=self.device) * self.noise_var**0.5, torch.full(shape, self.offset, device=self.device) + noise)
+        y = torch.where(choices == 1, torch.randn(shape, device=self.device) * self.noise_var**0.5, torch.full(shape, self.offset, device=self.device) + noise)
+        return torch.stack((x, y), dim=-1)
+    
+class Dataset2D(InitValDataset):
+    def __init__(self, distribution: torch.distributions.Distribution, batch_size: int):
+        super().__init__(
+            init_val_distribution=distribution,
             batch_size=batch_size,
         )
 

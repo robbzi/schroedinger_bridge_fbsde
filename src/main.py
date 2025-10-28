@@ -7,11 +7,16 @@ from torch import nn
 torch.set_float32_matmul_precision("medium")
 from pytorch_lightning.callbacks import ModelCheckpoint
 
+torch.autograd.set_detect_anomaly(True)
+
 from datasets import (
     ForwardBackwardDataloader,
     ForwardBackwardNoiseDataset,
     GaussianDataset,
+    GaussianPriorDataset,
+    Dataset2D,
     GaussianMixtureDataset,
+    CircleDistribution2D,
 )
 
 from utils import (
@@ -22,24 +27,19 @@ from utils import (
 )
 from plot import *
 
-from models import LitSchroedingerBridgePINN
+from models import LitSchroedingerBridgeFBSDE
 
 assert torch.cuda.is_available()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 debug_fast = False
-load_final_models = False
+load_final_models = True
 project_to_load_models_from = (
-    "2025-08-08_14-40-18"  # likelihood transport from mu=3 to 0
+    "2025-10-28_16-38-58" #<-- THIS is the good circle one
+    #"2025-10-28_15-13-17"
 )
-# "2025-08-07_18-29-38"  # good transport from mu=3 to 0
-# "2025-08-07_18-22-49" # bad transport from mu=5 to mu=0
-# "2025-08-07_17-32-09" # good transport from mu=1 to mu=0
-# "2025-08-07_12-59-10"
 
-# Meeting Matthias
-# as in paper, transport from mu=5 to mu=0
-# artifacts/schroedinger_bridge/2025-08-13_12-34-25/plots/paths.png
+#2025-10-28_15-40-07 circle ok some points in the middle
 
 
 checkpointing = False
@@ -64,16 +64,14 @@ if __name__ == "__main__":
     # wether to use the drift for optimization in boundary conditions
     differentiate_through_drift = True
 
-    # specify initial and final distributions for Gaussian dataset
-    mean_init = torch.Tensor([5.0])
-    cov_init = torch.tensor([1.0])
-    mean_final = torch.Tensor([0.0])
-    cov_final = torch.tensor([[1.0]])
+
+    # mean_final = torch.Tensor([0.0])
+    # cov_final = torch.tensor([[1.0]])
 
     # parameters
-    d = 1
+    d = 2
     T = 1
-    nbr_time_steps = 10#30
+    nbr_time_steps = 100#30
     domain_extrema = torch.tensor([-10.0, 10.0])
     time_grid_tensor = torch.linspace(0, T, nbr_time_steps + 1)
     constants = {
@@ -85,10 +83,11 @@ if __name__ == "__main__":
 
     # network parameters
     input_dimension = d
-    output_dimension = 1
-    n_hidden_layers = 5
-    hidden_size = d + 100
-    activation = nn.Sigmoid() #nn.GELU()   # nn.Softplus()  #ReLU2() #  # nn.Tanh
+    output_dimension = input_dimension
+    time_embed_dim = 128
+    n_hidden_layers = [1, 3, 1]  # for t, x, and out model
+    hidden_size = 256
+    activation = nn.SiLU #nn.Sigmoid() #nn.GELU()   # nn.Softplus()  #ReLU2() #  # nn.Tanh
     network_params = {
         "input_dimension": input_dimension,
         "output_dimension": output_dimension,
@@ -98,10 +97,10 @@ if __name__ == "__main__":
     }
 
     # train parameters
-    learning_rate = 0.01
+    learning_rate = 5e-4
     batch_size = 1000  # 60000
     batches_per_block = 100
-    train_steps = 4000  # 10**4
+    train_steps = 1000  # 10**4
     train_jointly = True
     train_params = {
         "learning_rate": learning_rate,
@@ -121,29 +120,19 @@ if __name__ == "__main__":
         batch_size = 1000
         train_steps = 10**1
 
-    # init_val_dataset = GaussianDataset(
-    #     mean=mean_init,
-    #     cov=cov_init,
-    #     dim=d,
-    #     batch_size=batch_size,
-    # )
-
-    init_val_dataset = GaussianMixtureDataset(
-        means_list=[mean_init, -mean_init],
-        covs_list=[cov_init, cov_init],
-        weights=[0.5, 0.5],
+    init_val_dataset = Dataset2D(
+        distribution=CircleDistribution2D(radius=5.0),
         batch_size=batch_size,
     )
 
-    final_val_dataset = GaussianDataset(
-        mean=mean_final,
-        cov=cov_final,
-        dim=d,
-        batch_size=batch_size,
-    )
+    # specify prior dataset
+    mean_prior = torch.Tensor([0.0, 0.0])
+    cov_prio = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    prior_dataset = GaussianPriorDataset(mean=mean_prior, cov=cov_prio, dim=2, batch_size=batch_size)
+
     dataset = ForwardBackwardNoiseDataset(
         init_val_dataset=init_val_dataset,
-        final_val_dataset=final_val_dataset,
+        final_val_dataset=prior_dataset,
         n_time_steps=nbr_time_steps,
         batch_size=batch_size,
         dim=d,
@@ -166,9 +155,10 @@ if __name__ == "__main__":
 
     if not load_final_models:
         # Initialize the model
-        model_sb_pinn = LitSchroedingerBridgePINN(
+        model_sb = LitSchroedingerBridgeFBSDE(
             input_dimension=input_dimension,
             output_dimension=output_dimension,
+            time_embed_dim=time_embed_dim,
             n_hidden_layers=n_hidden_layers,
             hidden_size=hidden_size,
             activation=activation,
@@ -179,6 +169,7 @@ if __name__ == "__main__":
             batches_per_block=batches_per_block,
             artifacts_dir=artifacts_dir,
             differentiate_through_drift=differentiate_through_drift,
+            prior_distribution=prior_dataset.init_val_distribution,
             train_jointly=train_jointly,
         )
 
@@ -203,7 +194,7 @@ if __name__ == "__main__":
         )
 
         # Train the model
-        trainer.fit(model_sb_pinn, dataloader)
+        trainer.fit(model_sb, dataloader)
         # save best model
         if checkpointing:
             best_model_path = checkpoint_callback.best_model_path
@@ -223,7 +214,7 @@ if __name__ == "__main__":
     else:  # load final forward models from a previous run
         print(f"Loading final models from project {project_to_load_models_from}...")
         final_model_path = get_load_path(project_to_load_models_from)
-        model_sb_pinn = LitSchroedingerBridgePINN.load_from_checkpoint(
+        model_sb = LitSchroedingerBridgeFBSDE.load_from_checkpoint(
             final_model_path, activation=activation
         )
         print("Loaded final forward models.")
@@ -231,9 +222,9 @@ if __name__ == "__main__":
     # plot
     if d <= 2:
         fig, ax = plot_models(
-            model_sb_pinn.forward_net,
-            model_sb_pinn.backward_net,
-            nbr_grid_points=100,
+            model_sb.forward_net,
+            model_sb.backward_net,
+            nbr_grid_points=100 if d == 1 else 20,
             constants=constants,
         )
         print(f"Saving plot to {artifacts_dir}/plots/models_final.png")
@@ -247,8 +238,14 @@ if __name__ == "__main__":
     # get brownian motion up to time T
 
     # plot 100 paths
-    print("Plotting 100 paths from prior...")
-    fig, ax = plot_paths_from_prior_and_final(model_sb_pinn, dataset, constants)
-    print(f"Saving plot to {artifacts_dir}/plots/paths.png")
-    fig.savefig(f"{artifacts_dir}/plots/paths.png")
-    print("Done.")
+    if d <= 2:
+        print("Plotting paths from prior...")
+        if d == 1:
+            fig, ax = plot_paths_1d_from_prior_and_final(model_sb, dataset, constants)
+        elif d == 2:
+            fig, ax = plot_paths_2d_from_prior_and_final(
+                model_sb, dataset, constants, max_nbr_paths=200, max_timesteps=4, horizontal=False
+            )
+        print(f"Saving plot to {artifacts_dir}/plots/paths.png")
+        fig.savefig(f"{artifacts_dir}/plots/paths.png")
+        print("Done.")

@@ -8,16 +8,65 @@ from pytorch_lightning.utilities.types import (
 from typing import Callable, Optional
 
 
-from utils import get_derivatives
+from utils import get_derivatives, time_positional_embedding
 
+class FCBlock(torch.nn.Module):
+    def __init__(
+        self,
+        input_dimension: int,
+        output_dimension: int,
+        n_hidden_layers: int,
+        hidden_size: int,
+        activation: Callable[[], nn.Module],
+    ):
+        super().__init__()
+
+        layers = []
+        if n_hidden_layers == 0:
+            layers.append(nn.Linear(input_dimension, output_dimension))
+        else:
+            layers.append(nn.Linear(input_dimension, hidden_size))
+            layers.append(activation())
+            for _ in range(n_hidden_layers - 1):
+                layers.append(nn.Linear(hidden_size, hidden_size))
+                layers.append(activation())
+            layers.append(nn.Linear(hidden_size, output_dimension))
+
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+    
+class ResBlock(FCBlock):
+    def __init__(
+        self,
+        input_dimension: int,
+        output_dimension: int,
+        n_hidden_layers: int,
+        hidden_size: int,
+        activation: Callable[[], nn.Module],
+    ):
+        assert input_dimension == output_dimension, "For ResBlock, input and output dimensions must be the same."
+        super().__init__(
+            input_dimension,
+            output_dimension,
+            n_hidden_layers,
+            hidden_size,
+            activation,
+        )
+        self.norm_factor = torch.sqrt(torch.tensor(2.0))
+
+    def forward(self, x):
+        return (x + self.model(x))/self.norm_factor
 
 class NNAnsatz(nn.Module):
     def __init__(
         self,
         input_dimension,
         output_dimension,
+        time_embed_dim,
         n_hidden_layers,
-        hidden_size,
+        hidden_dim,
         activation,
         learning_rate,  # 0.01
         domain_extrema: torch.Tensor,
@@ -27,19 +76,25 @@ class NNAnsatz(nn.Module):
         batch_normalization: bool,
         idx: Optional[int] = None,
         name: str = "NNAnsatz",
-        exp_output=False,
         # optimizer,
         # lr_scheduler,
         # decayRate,
     ):
         super().__init__()
 
-        # add time dimension
-        input_dimension = input_dimension + 1
         # TODO: remove this as this is always true
         self.prepend_time_grid = True
         self.input_dimension = input_dimension
         self.output_dimension = output_dimension
+        self.time_embed_dim = time_embed_dim
+        self.hidden_dim = hidden_dim
+        
+        assert len(n_hidden_layers) == 3, "n_hidden_layers must be a list of three integers for t, x, and out models."
+        self.n_hidden_layers_t = n_hidden_layers[0]
+        self.n_hidden_layers_x = n_hidden_layers[1]
+        self.n_hidden_layers_out = n_hidden_layers[2]
+        
+        self.activation = activation
         self.batch_normalization = batch_normalization
         self.domain_extrema = domain_extrema
         self.backward = backward
@@ -49,6 +104,8 @@ class NNAnsatz(nn.Module):
         self.name = name
         # self.time_continuous = time_continuous
 
+        self.n_res_blocks = 3
+        
         assert time_grid_tensor is not None, (
             "time_grid_tensor must be provided for time_continuous=True"
         )
@@ -61,34 +118,34 @@ class NNAnsatz(nn.Module):
             time_grid_tensor = torch.flip(time_grid_tensor, dims=[0])
         self.time_grid_tensor = time_grid_tensor
 
-        self.exp_output = exp_output
 
-        # self.dummy_layer = nn.Linear(input_dimension, 1000)
-        # self.relu = nn.ReLU()
-        # self.dummy_layer2 = nn.Linear(1000, output_dimension)
 
-        # Define layers
-        layers = []
-        if n_hidden_layers == 0:
-            layers.append(nn.Linear(input_dimension, output_dimension))
-        else:
-            layers.append(nn.Linear(input_dimension, hidden_size))
-            if self.batch_normalization:
-                layers.append(nn.BatchNorm1d(hidden_size))
-            layers.append(activation)
-            for _ in range(n_hidden_layers - 1):
-                layers.append(nn.Linear(hidden_size, hidden_size))
-                if self.batch_normalization:
-                    layers.append(nn.BatchNorm1d(hidden_size))
-                layers.append(activation)
-            layers.append(nn.Linear(hidden_size, output_dimension))
+        # # Define layers
+        # layers = []
+        # if n_hidden_layers == 0:
+        #     layers.append(nn.Linear(input_dimension, output_dimension))
+        # else:
+        #     layers.append(nn.Linear(input_dimension, hidden_size))
+        #     if self.batch_normalization:
+        #         layers.append(nn.BatchNorm1d(hidden_size))
+        #     layers.append(activation)
+        #     for _ in range(n_hidden_layers - 1):
+        #         layers.append(nn.Linear(hidden_size, hidden_size))
+        #         if self.batch_normalization:
+        #             layers.append(nn.BatchNorm1d(hidden_size))
+        #         layers.append(activation)
+        #     layers.append(nn.Linear(hidden_size, output_dimension))
 
-        self.model = nn.Sequential(*layers)
+        # self.model = nn.Sequential(*layers)
+
+        self.model = self._build_model()
+
         # Xavier initialization
-        for layer in self.model:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_normal_(layer.weight)
-                nn.init.zeros_(layer.bias)
+        for model in (self.t_model, self.x_model, self.output_model):
+            for layer in model:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_normal_(layer.weight)
+                    nn.init.zeros_(layer.bias)
 
         # # Setup optimizer
         # self.optimizer = torch.optim.Adam(
@@ -100,30 +157,66 @@ class NNAnsatz(nn.Module):
         #     optimizer=self.optimizer, gamma=decayRate
         # )
 
-    def forward(self, x):
-        if self.exp_output:
-            # If exp_output is True, apply exponential to the output
-            return torch.exp(self.model(x))
-        else:
-            # Normal forward pass
-            return self.model(x)
+    def _build_model(self):
+        t_layers = []
+        t_layers.append(FCBlock(
+            input_dimension= self.time_embed_dim,
+            output_dimension= self.hidden_dim,
+            n_hidden_layers= self.n_hidden_layers_t,
+            hidden_size= self.hidden_dim,
+            activation= self.activation,
+        ))
+        self.t_model = nn.Sequential(*t_layers)
 
-    def log_forward(self, x):
-        """
-        Logarithm of the forward pass to avoid unnecessary computation.
-        """
-        assert self.exp_output, "This method is only for models with exp_output=True."
-        if self.exp_output:
-            return self.model(x)
+        x_layers = []
+        x_layers.append(nn.Linear(self.input_dimension, self.hidden_dim))        
+        x_layers.extend([ResBlock(
+            input_dimension= self.hidden_dim,
+            output_dimension= self.hidden_dim,
+            n_hidden_layers= self.n_hidden_layers_x,
+            hidden_size= self.hidden_dim,
+            activation= self.activation,
+        ) for _ in range(self.n_res_blocks)])
+
+        self.x_model = nn.Sequential(*x_layers)
+
+        output_layers = []
+        # output_layers.append(ResBlock(
+        #     input_dimension= self.hidden_dim,
+        #     output_dimension= self.hidden_dim,
+        #     n_hidden_layers= self.n_hidden_layers_out,
+        #     hidden_size= self.hidden_dim,
+        #     activation= self.activation,
+        # ))
+        output_layers.append(FCBlock(
+            input_dimension= self.hidden_dim,
+            output_dimension= self.output_dimension,
+            n_hidden_layers= self.n_hidden_layers_out,
+            hidden_size= self.hidden_dim,
+            activation= self.activation,
+        ))
+
+        self.output_model = nn.Sequential(*output_layers)
+
+
+
+
+    def forward(self, x):
+        # assert x does not contain nan
+        #assert not torch.isnan(x).any(), "Input contains NaN values."
+        t = x[..., 0]
+        x_ = x[..., 1:]
+        t_embed = time_positional_embedding(t, self.time_embed_dim)
+        t_out = self.t_model(t_embed)
+        x_out = self.x_model(x_)
+        out =  self.output_model(t_out + x_out)
+        #assert not torch.isnan(out).any(), "Output contains NaN values."
+        return out
 
     def grad_forward(self, x, create_graph: bool = False, spacial_only: bool = False):
         """
         Gradient of the forward pass.
         """
-        assert not self.exp_output, (
-            "This method is only for models with exp_output=False."
-        )
-
         # x.requires_grad = True
         y = self.model(x)
         grad = torch.autograd.grad(
@@ -135,6 +228,24 @@ class NNAnsatz(nn.Module):
             return grad[:, 1:]
         else:
             return grad
+        
+   
+    def forward_and_divergence(self, x, create_graph: bool = False):
+        """
+        Forward pass and divergence of the forward pass.
+        """
+        # x.requires_grad = True
+        y = self.forward(x)
+        e = torch.randn_like(y)
+        grad = torch.autograd.grad(
+            y,
+            x,  # only spatial dimensions
+            e,
+            create_graph=create_graph,
+        )[0][:, :, 1:]
+
+        div = grad*e
+        return y, div
 
     def grad_log_forward(self, x):
         """
@@ -217,10 +328,8 @@ class NNAnsatz(nn.Module):
             X_for_forward = torch.cat((t_in, x_prev), dim=-1)
 
             current_dt = dt[t - 1]
-            drift = self.grad_forward(
+            drift = self.forward(
                 X_for_forward,
-                create_graph=self.differentiate_through_drift,
-                spacial_only=True,
             )
             # Euler–Maruyama step
             x_next = (
@@ -292,7 +401,7 @@ class DummyNNAnsatz(nn.Module):
             return torch.zeros((x.shape[0], 1), device=self.device)
 
 
-class LitSchroedingerBridgePINN(pl.LightningModule):
+class LitSchroedingerBridgeFBSDE(pl.LightningModule):
     def __init__(
         self,
         # optimizer,
@@ -300,7 +409,8 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         # decayRate,
         input_dimension: int,
         output_dimension: int,
-        n_hidden_layers: int,
+        time_embed_dim: int,
+        n_hidden_layers: list[int], # for t, x, and out model
         hidden_size: int,
         activation: Callable[[], nn.Module],
         learning_rate: float,
@@ -310,8 +420,8 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         batches_per_block: int,
         artifacts_dir: str,
         differentiate_through_drift: bool,
+        prior_distribution: Optional[torch.distributions.Distribution] = None,
         batch_normalization: bool = False,
-        exp_output: bool = False,
         train_jointly: bool = True,
     ):
         super().__init__()
@@ -319,19 +429,22 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
 
         self.input_dimension = input_dimension
         self.output_dimension = output_dimension
+        self.time_embed_dim = time_embed_dim
         self.n_hidden_layers = n_hidden_layers
         self.hidden_size = hidden_size
         self.activation = activation
         self.learning_rate = learning_rate
         self.domain_extrema = domain_extrema
         self.time_grid_tensor = time_grid_tensor
+        self.dt = time_grid_tensor[1] - time_grid_tensor[0]
         self.train_steps = train_steps
         self.batches_per_block = batches_per_block
         self.artifacts_dir = artifacts_dir
         self.differentiate_through_drift = differentiate_through_drift
         self.batch_normalization = batch_normalization
-        self.exp_output = exp_output
         self.train_jointly = train_jointly
+
+        self.prior_distribution = prior_distribution
 
         self.forward_net = self._create_nn_ansatz(
             name="forward model", idx=0, backward=False
@@ -344,33 +457,16 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         self.block_count = 0
         self.epoch_count = 0
 
-        # TODO the lightning module should not care about physics and should not handle the log probabilities
-        # physics parameters
-        self.g = 1.0
-        self.dim = 1
-        cov = 1.0
-        self.log_p_0 = (
-            lambda x: (-0.5 * self.dim * torch.log(torch.tensor(2 * torch.pi * cov)))
-            + -0.5 * torch.sum((x - 5) ** 2 / cov, dim=-1)[:, None]
-        )
-        self.log_p_T = (
-            lambda x: (-0.5 * self.dim * torch.log(torch.tensor(2 * torch.pi * cov)))
-            + -0.5 * torch.sum((x) ** 2 / cov, dim=-1)[:, None]
-        )
+        self.decay_rate = 0.995
 
-        # not configurable for now
-        self.loss_weights = {
-            "pde": 1.0,
-            "bc": 1.0,#10.0,
-            "loglik": 20.0,
-        }
-        self.decay_rate = 0.993
+        # TODO: this should be defined externally
+        self.g = 1.0  # diffusion coefficient
 
         # Important: This property activates manual optimization.
         self.automatic_optimization = False
 
     def configure_optimizers(self):
-        opimizer_forward = torch.optim.Adam(
+        opimizer_forward = torch.optim.AdamW(
             self.forward_net.parameters(), lr=self.learning_rate
         )
 
@@ -388,7 +484,7 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
             optimizer=opimizer_forward, lr_scheduler=lr_scheduler_config_forward
         )
 
-        optimizer_backward = torch.optim.Adam(
+        optimizer_backward = torch.optim.AdamW(
             self.backward_net.parameters(), lr=self.learning_rate
         )
 
@@ -414,41 +510,28 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
         # TODO: we only need forward or backward points depending on the current block
         # when not training jointly
         # create paths
-        x_forward_paths = self._create_paths(batch, backward=False)
-        x_backward_paths = self._create_paths(batch, backward=True)
-        x_forward_bc = x_forward_paths[:, -1, :]
-        x_backward_bc = x_backward_paths[:, 0, :]
+        # x_forward_paths = self._create_paths(batch, backward=False)
+        # x_backward_paths = self._create_paths(batch, backward=True)
+        # x_forward_bc = x_forward_paths[:, -1, :]
+        # x_backward_bc = x_backward_paths[:, 0, :]
 
-        x_init_vals = x_forward_paths[:, 0, :].detach()
-        x_final_vals = x_backward_paths[:, -1, :].detach()
+        # x_init_vals = x_forward_paths[:, 0, :].detach()
+        # x_final_vals = x_backward_paths[:, -1, :].detach()
 
-        # Determine which network to train based on current block
-        block = (self.training_step_count // self.batches_per_block) % 2
-        self.training_step_count += 1
-        if self.training_step_count % self.batches_per_block == 0:
-            self.block_count += 1
-            if self.block_count % 2 == 0:
-                self.epoch_count += 1
+
 
         if self.train_jointly:
             # ===== Joint Optimization =====
 
-            # loglik loss 
-            # loss_loglik_init = self._compute_loglik_loss_jointly(x_init_vals)
-            # loss_loglik_final = self._compute_loglik_loss_jointly(x_final_vals)
-            # loss_loglik = self.loss_weights["loglik"] * (loss_loglik_init + loss_loglik_final)
+            x_forward_paths = self._create_paths(batch, backward=False)
 
-            loss_fwd, loss_fwd_pde, loss_fwd_bc = self._compute_loss_forward(
-                x_forward_paths, x_forward_bc
-            )
-            loss_bwd, loss_bwd_pde, loss_bwd_bc = self._compute_loss_backward(
-                x_backward_paths, x_backward_bc
-            )
-            loss_total = loss_fwd + loss_bwd # + loss_loglik
+            joint_loss = self._compute_joint_loss(x_forward_paths)
 
             opt_fwd.zero_grad()
             opt_bwd.zero_grad()
-            self.manual_backward(loss_total)
+            self.manual_backward(joint_loss)
+            torch.nn.utils.clip_grad_norm_(self.forward_net.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.backward_net.parameters(), 1.0)
             opt_fwd.step()
             opt_bwd.step()
 
@@ -462,24 +545,25 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
                 {
                     # get lr with scheduler
                     "lr": opt_fwd.param_groups[0]["lr"],
-                    "loss_total": loss_total,
-                    #"loss_loglik_init": loss_loglik_init,
-                    #"loss_loglik_final": loss_loglik_final,
-                    "loss_forward_pde": loss_fwd_pde,
-                    "loss_forward_bc": loss_fwd_bc,
-                    "loss_backward_pde": loss_bwd_pde,
-                    "loss_backward_bc": loss_bwd_bc,
+                    "loss_joint": joint_loss.item(),
                 },
                 prog_bar=True,
             )
         else:
+            # Determine which network to train based on current block
+            block = (self.training_step_count // self.batches_per_block) % 2
+            self.training_step_count += 1
+            if self.training_step_count % self.batches_per_block == 0:
+                self.block_count += 1
+                if self.block_count % 2 == 0:
+                    self.epoch_count += 1
             # ===== Blockwise Alternating Optimization =====
             if block == 0:
 
                 # loglik loss
                 loss_loglik_forward = self.loss_weights["loglik"] *self._compute_loglik_loss_forward(x_final_vals)
                 assert False, "fix this first"
-                loss_fwd, loss_fwd_pde, loss_fwd_bc = self._compute_loss_backward(x_backward_paths, x_backward_bc)#self._compute_loss_forward(x_forward_paths, x_forward_bc)
+                loss_fwd, loss_fwd_pde, loss_fwd_bc = self._compute_alt_loss_backward(x_backward_paths, x_backward_bc)#self._compute_loss_forward(x_forward_paths, x_forward_bc)
 
                 opt_fwd.zero_grad()
                 self.manual_backward(loss_fwd)
@@ -505,7 +589,7 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
                 # loglik loss
                 loss_loglik_backward = self.loss_weights["loglik"] * self._compute_loglik_loss_backward(x_init_vals)
 
-                loss_bwd, loss_bwd_pde, loss_bwd_bc = self._compute_loss_forward(x_forward_paths, x_forward_bc)#self._compute_loss_backward(x_backward_paths, x_backward_bc)
+                loss_bwd, loss_bwd_pde, loss_bwd_bc = self._compute_alt_loss_forward(x_forward_paths, x_forward_bc)#self._compute_loss_backward(x_backward_paths, x_backward_bc)
 
                 opt_bwd.zero_grad()
                 self.manual_backward(loss_bwd)
@@ -568,47 +652,54 @@ class LitSchroedingerBridgePINN(pl.LightningModule):
             input_dimension=self.input_dimension,
             output_dimension=self.output_dimension,
             n_hidden_layers=self.n_hidden_layers,
-            hidden_size=self.hidden_size,
+            hidden_dim=self.hidden_size,
             activation=self.activation,
+            time_embed_dim=self.time_embed_dim,
             learning_rate=self.learning_rate,
             domain_extrema=self.domain_extrema,
             time_grid_tensor=self.time_grid_tensor,
             backward=backward,
             differentiate_through_drift=self.differentiate_through_drift,
             batch_normalization=self.batch_normalization,
-            exp_output=self.exp_output,
             idx=idx,
         )
 
-    def _compute_loss_forward(self, x_interior, x_bc):
+    def _compute_joint_loss(self, x_interior):
+        """
+        Compute the joint loss for the Schrödinger Bridge.
+        """
+        assert self.prior_distribution is not None, "Prior distribution must be provided for joint loss computation."
+
+        batch_size = x_interior.shape[0]
+        dt = self.forward_net.time_grid_tensor[1:] - self.forward_net.time_grid_tensor[:-1]
+
+        # divergence of backward net
+        z_hat, div_z_hat = self.backward_net.forward_and_divergence(x_interior, create_graph=self.differentiate_through_drift)
+        z = self.forward_net(x_interior)
+        loss = 0.5*(z+z_hat).pow(2) + self.g*div_z_hat
+        loss = (self.dt*loss).sum() / batch_size
+        loss = loss - self.prior_distribution.log_prob(x_interior[:, -1, 1:]).mean()
+
+        return loss
+
+    def _compute_alt_loss_forward(self, x_interior):
         """
         Compute the loss for the forward model.
         """
-        # Compute PDE residual
-        # pde_loss = self._compute_pde_loss_forward(x_interior.detach())
-        # dummy pde loss
-        pde_loss = torch.tensor(0.0, device=x_interior.device)
 
-        # Compute boundary condition loss
-        # bc_loss = self._compute_boundary_loss_forward(x_bc)
+        batch_size = x_interior.shape[0]
+        dt = self.forward_net.time_grid_tensor[1:] - self.forward_net.time_grid_tensor[:-1]
 
-        # Compute log likelihood loss (simple log likelihood)
-        # bc_loss = self._compute_naive_loglik_loss_forward(x_bc)
-
-        # Compute log likelihood loss (FBSDE loss)
-        bc_loss = self._compute_loglik_fbsde_loss_forward(x_interior)
-        
-        # dummy log likelihood loss
-        # bc_loss = torch.tensor(0.0, device=x_interior.device)
-
-        # Total loss
-        total_loss = (
-            self.loss_weights["pde"] * pde_loss + self.loss_weights["bc"] * bc_loss
-        )
-
-        return total_loss, pde_loss, bc_loss
+        # divergence of backward net
+        z_hat, div_z_hat = self.backward_net.forward_and_divergence(x_interior, create_graph=self.differentiate_through_drift)
+        z = self.forward_net(x_interior)
+        loss = 0.5*(z_hat).pow(2) + self.g*div_z_hat + z*z_hat
+        loss = (self.dt*loss).sum() / batch_size
+        loss = loss - self.prior_distribution.log_prob(x_interior[:, -1, 1:]).mean()
+        assert not torch.isnan(loss), "Loss is NaN."
+        return loss 
     
-    def _compute_loss_backward(self, x_interior, x_bc):
+    def _compute_alt_loss_backward(self, x_interior, x_bc):
         """
         Compute the loss for the backward model.
         """
